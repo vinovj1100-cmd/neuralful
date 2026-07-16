@@ -1,0 +1,5 @@
+tesseract-ocr
+libtesseract-dev
+libzbar0
+poppler-utils
+libgl1
