@@ -237,22 +237,36 @@ class OraclePredictiveEngine:
     """Double exponential smoothing forecast engine for inventory prediction and reorder optimization."""
     def __init__(self):
         self.history = deque(maxlen=180)
-        self._seed_from_inventory()
+        self._seeded = False
 
     def _seed_from_inventory(self):
-        inv = get_inventory()
-        if not inv.empty:
-            base_stock = int(inv["stock"].sum())
+        if self._seeded:
+            return
+        try:
+            inv = get_inventory()
+            if not inv.empty:
+                base_stock = int(inv["stock"].sum())
+                for i in range(45):
+                    date = datetime.now() - timedelta(days=45-i)
+                    noise = random.randint(-int(base_stock*0.06), int(base_stock*0.04))
+                    trend = -i * 2
+                    self.history.append({"date": date, "stock": max(0, base_stock + noise + trend), "orders": random.randint(8, 65), "fulfillment_time": random.uniform(0.4, 3.5)})
+            self._seeded = True
+        except Exception:
+            # DB not ready yet, seed with synthetic data
+            base_stock = 1000
             for i in range(45):
                 date = datetime.now() - timedelta(days=45-i)
-                noise = random.randint(-int(base_stock*0.06), int(base_stock*0.04))
+                noise = random.randint(-60, 40)
                 trend = -i * 2
                 self.history.append({"date": date, "stock": max(0, base_stock + noise + trend), "orders": random.randint(8, 65), "fulfillment_time": random.uniform(0.4, 3.5)})
+            self._seeded = True
 
     def record_day(self, stock, orders, fulfillment_time):
         self.history.append({"date": datetime.now(), "stock": stock, "orders": orders, "fulfillment_time": fulfillment_time})
 
     def forecast(self, days=14):
+        self._seed_from_inventory()
         if len(self.history) < 7:
             return None
         stocks = [h["stock"] for h in self.history]
@@ -275,6 +289,7 @@ class OraclePredictiveEngine:
         return {"forecast": forecast_vals, "recommended_reorder": max(0, reorder_point - int(forecast_vals[-1])), "stockout_risk": stockout_risk, "confidence": min(95, 35 + len(self.history) // 4), "trend": "DECLINING" if trend < -5 else "STABLE" if abs(trend) < 5 else "RISING", "avg_daily_orders": round(avg_orders, 1)}
 
     def get_history_df(self):
+        self._seed_from_inventory()
         return pd.DataFrame(list(self.history))
 
 
@@ -704,7 +719,7 @@ def apply_custom_theme():
 apply_custom_theme()
 
 st.set_page_config(page_title="NEURAL FULFILLMENT — YESI v3.0", layout="wide", page_icon="🧠")
-init_db()
+init_db()  # Initialize database BEFORE any engine that queries it
 _guardian = get_guardian()
 
 if "authenticated" not in st.session_state:
