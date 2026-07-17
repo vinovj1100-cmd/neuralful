@@ -1121,30 +1121,50 @@ with tab_pdf:
             if not target_entries or not label_file:
                 st.warning("Please provide your target list and upload a PDF.")
             else:
-                with st.spinner("Scanning labels with Multi-Angle OCR..."):
+                with st.spinner("Scanning labels with Enhanced Multi-Region OCR..."):
                     try:
                         pdf_reader = pypdf.PdfReader(io.BytesIO(label_file.getvalue()))
                         pdf_writer = pypdf.PdfWriter()
-                        images = convert_from_bytes(label_file.getvalue(), dpi=200)
+                        images = convert_from_bytes(label_file.getvalue(), dpi=300)  # Higher DPI for better accuracy
                         page_matches = []
 
                         for i, img in enumerate(images):
                             w, h = img.size
                             all_text = ""
+
+                            # 1. Barcodes
                             barcodes = decode(img)
                             for b in barcodes:
                                 all_text += " " + b.data.decode("utf-8", errors="ignore")
-                            all_text += " " + pytesseract.image_to_string(img)
-                            right_crop = img.crop((int(w * 0.60), 0, w, h))
-                            for angle in [90, 270]:
-                                rotated_crop = right_crop.rotate(angle, expand=True)
-                                ocr_vertical = pytesseract.image_to_string(rotated_crop, config='--psm 6')
-                                all_text += " " + ocr_vertical
-                            phones_found = list(set(re.findall(r'\b\d{7}\b', all_text)))
-                            codes_found = list(set(re.findall(r'\b\d{4}\b', all_text)))
+
+                            # 2. Full page OCR
+                            all_text += " " + pytesseract.image_to_string(img, config='--psm 6')
+
+                            # 3. Enhanced bottom-right QR crop (primary location for phone+code on WB labels)
+                            right_crop = img.crop((int(w * 0.55), int(h * 0.55), w, h))
+                            for angle in [0, 90, 180, 270]:
+                                rotated = right_crop.rotate(angle, expand=True)
+                                for psm in ['--psm 6', '--psm 7', '--psm 13']:
+                                    ocr = pytesseract.image_to_string(rotated, config=psm)
+                                    all_text += " " + ocr
+
+                            # 4. Additional mid-bottom crop for addresses/codes
+                            mid_crop = img.crop((int(w * 0.4), int(h * 0.7), int(w * 0.9), h))
+                            all_text += " " + pytesseract.image_to_string(mid_crop, config='--psm 6')
+
+                            phones_found = list(set(re.findall(r'\d{7}', all_text)))
+                            codes_found = list(set(re.findall(r'\d{4}', all_text)))
                             tracking_ids = SCANNING_ID_REGEX.findall(all_text)
                             tracking_id = tracking_ids[0] if tracking_ids else "N/A"
-                            page_matches.append({'page_idx': i, 'page_obj': pdf_reader.pages[i], 'tracking_id': tracking_id, 'phones': phones_found, 'codes': codes_found})
+
+                            page_matches.append({
+                                'page_idx': i, 
+                                'page_obj': pdf_reader.pages[i], 
+                                'tracking_id': tracking_id, 
+                                'phones': phones_found, 
+                                'codes': codes_found,
+                                'raw_text_sample': all_text[-200:]  # Debug: last 200 chars of extracted text
+                            })
 
                         matched_page_indices = []
                         results_dataset = []
@@ -1197,6 +1217,16 @@ with tab_pdf:
                                 if 'ℹ️' in str(val): return 'background-color: rgba(255, 193, 7, 0.2); color: #ffc107;'
                                 return ''
                             st.dataframe(res_df.style.applymap(style_rows, subset=['Status']), use_container_width=True, hide_index=True)
+
+                            # Debug: show raw OCR samples for unmatched pages to help troubleshoot
+                            with st.expander("🔍 Debug OCR Samples (Unmatched Pages)", expanded=False):
+                                unmatched_samples = [pm for pm in page_matches if pm['page_idx'] not in matched_page_indices]
+                                if unmatched_samples:
+                                    for pm in unmatched_samples[:5]:  # limit to first 5
+                                        st.markdown(f"**Page {pm['page_idx']+1}** — Phones: `{pm['phones']}` | Codes: `{pm['codes']}`")
+                                        st.code(pm['raw_text_sample'], language='text')
+                                else:
+                                    st.info("All pages were matched successfully.")
                             matched_count = sum(1 for r in results_dataset if '✅' in r['Status'])
                             missing_count = sum(1 for r in results_dataset if '❌' in r['Status'])
                             c_stat1, c_stat2, c_stat3 = st.columns(3)
