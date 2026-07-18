@@ -30,17 +30,38 @@ from db import (
     create_order, update_order_status, get_templates, save_template,
     save_memory, get_memory, get_recent_preferences, add_action_log,
     record_preference, auth_login, add_user, load_sim_db, save_sim_db,
+    get_inventory_full, get_inventory_policy, upsert_inventory_policy,
+    create_wave, get_waves, add_pick_task, get_pick_tasks,
+    complete_pick_task, close_wave, get_slotting,
+    create_cycle_count, get_cycle_counts, complete_cycle_count,
+    create_asn, receive_asn, get_asns,
+    create_dock_appointment, get_dock_appointments,
+    create_rma, update_rma_disposition, get_rmas,
+    create_replenishment, complete_replenishment, get_replenishments,
+    save_kpi_snapshot, get_kpi_history, get_labor_logs, get_labor_summary,
+)
+from efficiency import (
+    WavePlanner, ABCSlottingOptimizer, ReplenishmentEngine,
+    CycleCountScheduler, KPICalculator,
 )
 from memory import (
     get_setting, set_setting, suggest_alias, suggest_template, upsert_alias,
 )
 from sync import enqueue_action, process_queue, queue_status, can_sync_now
-from ozone_wms_guardian import Guardian, GuardianConfig
-from ozone_wms_guardian.admin.dashboard import render_guardian_dashboard
+
+# v4.1 — WB Label Processor
+from wb_label_processor import WBLabelProcessor, parse_target_list, WBLabelData
+
+# v4.0 efficiency engine singletons (shared across the Control Tower tab + admin).
+_wave_planner = WavePlanner()
+_slotting = ABCSlottingOptimizer()
+_replen_engine = ReplenishmentEngine()
+_cycle_scheduler = CycleCountScheduler()
+_kpi = KPICalculator()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# CREATIVE ADVANCED SYSTEMS — NEURAL FULFILLMENT PLATFORM v3.0
+# CREATIVE ADVANCED SYSTEMS — NEURAL FULFILLMENT PLATFORM v4.1
 # ═════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -253,7 +274,6 @@ class OraclePredictiveEngine:
                     self.history.append({"date": date, "stock": max(0, base_stock + noise + trend), "orders": random.randint(8, 65), "fulfillment_time": random.uniform(0.4, 3.5)})
             self._seeded = True
         except Exception:
-            # DB not ready yet, seed with synthetic data
             base_stock = 1000
             for i in range(45):
                 date = datetime.now() - timedelta(days=45-i)
@@ -376,20 +396,13 @@ class EcoLogisticsTracker:
 # ═════════════════════════════════════════════════════════════════════════════
 # SYSTEM INITIALIZATION
 # ═════════════════════════════════════════════════════════════════════════════
-_guardian = None
 _neural_vision = NeuralVisionSystem()
 _route_optimizer = QuantumRouteOptimizer()
 _oracle = OraclePredictiveEngine()
 _sentinel = AnomalySentinel()
 _command_ai = NeuralCommandInterface()
 _eco_tracker = EcoLogisticsTracker()
-
-def get_guardian():
-    global _guardian
-    if _guardian is None:
-        _guardian = Guardian(GuardianConfig())
-        _guardian.start()
-    return _guardian
+_wb_processor = WBLabelProcessor(dpi=300)
 
 
 # --- CORE LOGIC UTILITIES ---
@@ -420,129 +433,10 @@ def calculate_luhn(base14):
 
 def log_action(user, action, ref=None):
     add_action_log(action, ref, None, user)
-    # Gamification: award XP for actions
     if user in st.session_state.operator_stats:
         xp_map = {"inventory_upsert": 15, "order_create": 20, "order_update": 10, "audit": 25, "scan": 5, "PDF_SEQUENCED": 30, "report": 10}
         xp = xp_map.get(action.split(":")[0], 5)
         st.session_state.operator_stats[user].add_xp(xp, "pick" if "inventory" in action or "order" in action else "audit" if "audit" in action else "scan")
-
-# --- 3D HOLODECK RENDERER ---
-def render_holodeck_3d():
-    return """
-    <div id="warehouse-3d" style="width:100%; height:600px; background:#050a19; border-radius:16px; overflow:hidden; position:relative; border:1px solid rgba(100,255,218,0.2);">
-      <canvas id="glcanvas" style="width:100%; height:100%;"></canvas>
-      <div style="position:absolute; top:15px; left:15px; color:#64ffda; font-family:monospace; font-size:11px; background:rgba(5,10,25,0.85); padding:12px; border-radius:8px; border:1px solid rgba(100,255,218,0.15);">
-        <div style="font-weight:bold; font-size:13px; margin-bottom:6px;">🏭 WAREHOUSE DIGITAL TWIN</div>
-        <div id="twin-stats">Zones: 24 | Active: 18 | Temp: 22°C | Humidity: 45%</div>
-        <div style="margin-top:4px; color:#8892b0;">Live Neural Feed: <span style="color:#64ffda;">ONLINE</span></div>
-      </div>
-    </div>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-    <script>
-      const scene = new THREE.Scene();
-      scene.background = new THREE.Color(0x050a19);
-      scene.fog = new THREE.FogExp2(0x050a19, 0.015);
-      const container = document.getElementById('warehouse-3d');
-      const camera = new THREE.PerspectiveCamera(60, container.clientWidth/container.clientHeight, 0.1, 1000);
-      const renderer = new THREE.WebGLRenderer({canvas: document.getElementById('glcanvas'), antialias: true, alpha: true});
-      renderer.setSize(container.clientWidth, container.clientHeight);
-      renderer.setPixelRatio(window.devicePixelRatio);
-
-      const ambientLight = new THREE.AmbientLight(0x404040, 1.5);
-      scene.add(ambientLight);
-      const dirLight = new THREE.DirectionalLight(0x64ffda, 0.8);
-      dirLight.position.set(20, 30, 20);
-      scene.add(dirLight);
-      const pointLight = new THREE.PointLight(0x00b4db, 1, 60);
-      pointLight.position.set(0, 15, 0);
-      scene.add(pointLight);
-
-      // Floor
-      const floorGeo = new THREE.PlaneGeometry(80, 60);
-      const floorMat = new THREE.MeshPhongMaterial({color: 0x0a192f, transparent: true, opacity: 0.8, side: THREE.DoubleSide});
-      const floor = new THREE.Mesh(floorGeo, floorMat);
-      floor.rotation.x = -Math.PI / 2;
-      scene.add(floor);
-
-      // Grid
-      const gridHelper = new THREE.GridHelper(80, 40, 0x64ffda, 0x0a192f);
-      gridHelper.position.y = 0.01;
-      scene.add(gridHelper);
-
-      // Racks with neon edges
-      const rackGeo = new THREE.BoxGeometry(3, 6, 1.5);
-      const rackMat = new THREE.MeshPhongMaterial({color: 0x112240, transparent: true, opacity: 0.85});
-      const edgesGeo = new THREE.EdgesGeometry(rackGeo);
-      const edgesMat = new THREE.LineBasicMaterial({color: 0x64ffda, transparent: true, opacity: 0.6});
-
-      for(let i=0; i<24; i++) {
-        const rack = new THREE.Mesh(rackGeo, rackMat);
-        const x = (i%6)*10 - 25;
-        const z = Math.floor(i/6)*10 - 15;
-        rack.position.set(x, 3, z);
-        scene.add(rack);
-        const edges = new THREE.LineSegments(edgesGeo, edgesMat);
-        edges.position.copy(rack.position);
-        scene.add(edges);
-      }
-
-      // Animated packages
-      const pkgGeo = new THREE.BoxGeometry(1, 1, 1);
-      const packages = [];
-      for(let i=0; i<20; i++) {
-        const color = new THREE.Color().setHSL(0.45 + Math.random()*0.15, 0.9, 0.6);
-        const pkg = new THREE.Mesh(pkgGeo, new THREE.MeshPhongMaterial({color: color, emissive: color, emissiveIntensity: 0.3}));
-        pkg.position.set(Math.random()*50-25, 0.5, Math.random()*30-15);
-        scene.add(pkg);
-        packages.push({mesh: pkg, speed: 0.01 + Math.random()*0.02, offset: Math.random()*Math.PI*2, amp: 0.3 + Math.random()*0.5});
-      }
-
-      // Particle system (dust/data)
-      const particleGeo = new THREE.BufferGeometry();
-      const particleCount = 200;
-      const posArray = new Float32Array(particleCount*3);
-      for(let i=0; i<particleCount*3; i++) {
-        posArray[i] = (Math.random()-0.5)*80;
-      }
-      particleGeo.setAttribute('position', new THREE.BufferAttribute(posArray, 3));
-      const particleMat = new THREE.PointsMaterial({size: 0.15, color: 0x64ffda, transparent: true, opacity: 0.6});
-      const particles = new THREE.Points(particleGeo, particleMat);
-      scene.add(particles);
-
-      camera.position.set(35, 25, 35);
-      camera.lookAt(0, 0, 0);
-
-      let angle = 0;
-      function animate() {
-        requestAnimationFrame(animate);
-        const time = Date.now() * 0.001;
-        angle += 0.002;
-        camera.position.x = 40 * Math.cos(angle);
-        camera.position.z = 40 * Math.sin(angle);
-        camera.lookAt(0, 2, 0);
-
-        packages.forEach(p => {
-          p.mesh.position.y = 0.5 + Math.sin(time * 2 + p.offset) * p.amp * 0.3;
-          p.mesh.rotation.y += p.speed;
-          p.mesh.rotation.x = Math.sin(time + p.offset) * 0.1;
-        });
-
-        particles.rotation.y = time * 0.05;
-        particles.rotation.x = time * 0.02;
-
-        renderer.render(scene, camera);
-      }
-      animate();
-
-      window.addEventListener('resize', () => {
-        const w = container.clientWidth;
-        const h = container.clientHeight;
-        renderer.setSize(w, h);
-        camera.aspect = w / h;
-        camera.updateProjectionMatrix();
-      });
-    </script>
-    """
 
 
 # --- CUSTOM CSS (ENHANCED CYBERPUNK THEME) ---
@@ -709,6 +603,51 @@ def apply_custom_theme():
             0%, 100% { opacity: 1; }
             50% { opacity: 0.7; }
         }
+        [data-testid="stSidebar"] { min-width: 240px; }
+        .glass, .holographic-card { padding: 14px !important; }
+        [data-testid="stMetricValue"] { font-size: 1.4rem !important; }
+        .stButton > button, .stFormSubmitButton > button {
+            min-height: 44px; border-radius: 12px !important;
+        }
+        [data-baseweb="tab-list"] { overflow-x: auto; flex-wrap: nowrap; }
+        [data-baseweb="tab"] { white-space: nowrap; }
+        .ct-subnav { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }
+        .ct-chip {
+            background: rgba(100,255,218,0.08); border:1px solid rgba(100,255,218,0.25);
+            color:#ccd6f6; padding:8px 14px; border-radius:20px; font-size:0.8rem;
+            cursor:pointer; transition: all .2s; text-decoration:none;
+        }
+        .ct-chip:hover { background: rgba(100,255,218,0.2); }
+        .pwa-banner {
+            background: linear-gradient(90deg, rgba(0,180,219,0.15), rgba(100,255,218,0.12));
+            border:1px solid rgba(100,255,218,0.3); border-radius:14px;
+            padding:12px 16px; margin-bottom:14px; font-size:0.85rem; color:#ccd6f6;
+        }
+        @media (max-width: 768px) {
+            .stApp { background-size: cover; }
+            [data-testid="stSidebar"] { min-width: 200px; }
+            h1 { font-size: 1.4rem !important; }
+            h2, h3 { font-size: 1.1rem !important; }
+            .glass, .holographic-card { padding: 10px !important; }
+            [data-testid="stMetricValue"] { font-size: 1.1rem !important; }
+            [data-testid="stHorizontalBlock"] { flex-direction: column !important; }
+        }
+        /* v4.1 PDF sequencer enhancements */
+        .pdf-debug-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 12px;
+        }
+        .pdf-debug-card {
+            background: rgba(10, 20, 40, 0.7);
+            border: 1px solid rgba(100, 255, 218, 0.15);
+            border-radius: 12px;
+            padding: 12px;
+            font-size: 0.8rem;
+        }
+        .match-confidence-high { border-left: 3px solid #00ff88; }
+        .match-confidence-med { border-left: 3px solid #ffd93d; }
+        .match-confidence-low { border-left: 3px solid #ff6b6b; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -716,11 +655,10 @@ def apply_custom_theme():
 
 
 # INITIALIZATION
+st.set_page_config(page_title="NEURAL FULFILLMENT — YESI v4.1", layout="wide", page_icon="🧠",
+                   menu_items={"About": "Neural Fulfillment Platform v4.1 — Autonomous Warehouse Intelligence + Advanced WB Label Sequencing"})
 apply_custom_theme()
-
-st.set_page_config(page_title="NEURAL FULFILLMENT — YESI v3.0", layout="wide", page_icon="🧠")
-init_db()  # Initialize database BEFORE any engine that queries it
-_guardian = get_guardian()
+init_db()
 
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
@@ -734,14 +672,16 @@ if 'neural_chat_history' not in st.session_state:
     st.session_state.neural_chat_history = []
 if 'last_anomaly_scan' not in st.session_state:
     st.session_state.last_anomaly_scan = None
+if 'wb_debug_images' not in st.session_state:
+    st.session_state.wb_debug_images = {}
 
 
 # --- AUTHENTICATION INTERFACE ---
 if not st.session_state.authenticated:
     st.markdown('<div class="login-glass">', unsafe_allow_html=True)
-    st.markdown('<div class="wms-logo-placeholder">N3</div>', unsafe_allow_html=True)
+    st.markdown('<div class="wms-logo-placeholder">N4</div>', unsafe_allow_html=True)
     st.markdown('<h2 style="color:#ccd6f6; margin-bottom:0.5rem;">Neural Fulfillment</h2>', unsafe_allow_html=True)
-    st.markdown('<p style="color:#8892b0; font-size:0.9rem; margin-bottom:2rem;">YESI v3.0 — Autonomous Warehouse Intelligence</p>', unsafe_allow_html=True)
+    st.markdown('<p style="color:#8892b0; font-size:0.9rem; margin-bottom:2rem;">YESI v4.1 — Autonomous Warehouse Intelligence</p>', unsafe_allow_html=True)
 
     with st.form("login_form", clear_on_submit=False):
         uname = st.text_input("Username", placeholder="Operator ID", label_visibility="collapsed")
@@ -774,15 +714,14 @@ if not st.session_state.authenticated:
 user = st.session_state.user["username"]
 role = st.session_state.user["role"]
 
-# Initialize operator stats if not exists
 if user not in st.session_state.operator_stats:
     st.session_state.operator_stats[user] = OperatorStats(user)
 ops = st.session_state.operator_stats[user]
 
 st.title("🧠 Neural Fulfillment Operations")
-st.caption(f"Welcome, {user} ({role}). Autonomous warehouse intelligence with predictive analytics, neural vision, and quantum routing.")
+st.caption(f"Welcome, {user} ({role}). v4.1 with Advanced WB Label Sequencing, Vertical Tracking Detection & Workflow Automation.")
 
-# --- SIDEBAR: SYSTEM STATUS, GAMIFICATION & SETTINGS ---
+# --- SIDEBAR ---
 with st.sidebar:
     st.header("🌐 System Status")
     online_access_status = can_sync_now()
@@ -797,7 +736,6 @@ with st.sidebar:
     status_msg = "ONLINE" if is_online else "OFFLINE (Queue Paused)"
     st.markdown(f"Status: :{status_color}[{status_msg}]")
 
-    # Gamification Panel
     st.divider()
     st.header("🎮 Operator Neural Link")
     with st.container():
@@ -830,9 +768,11 @@ with st.sidebar:
     with st.expander("Site Settings"):
         operator = st.text_input("Operator name", value=get_setting("operator_name", ""))
         site = st.text_input("Site name", value=get_setting("site_name", "Main"))
+        pwa_url = st.text_input("Mobile PWA URL", value=get_setting("pwa_url", ""))
         if st.button("Save settings"):
             set_setting("operator_name", operator)
             set_setting("site_name", site)
+            set_setting("pwa_url", pwa_url)
             st.success("Saved")
             log_action(user, "Settings Updated", f"Site: {site}")
 
@@ -850,7 +790,6 @@ with st.sidebar:
 
     st.divider()
     st.header("📋 Reports")
-    st.markdown("Download snapshot of current operations.")
     if st.button("📊 Generate Operations Summary", use_container_width=True):
         with st.spinner("Generating neural summary..."):
             log_action(user, "Report Generated", "Operations Summary")
@@ -872,17 +811,14 @@ inv = get_inventory()
 orders = get_orders()
 q = queue_status()
 
-# Run anomaly scan in background
 if inv is not None and not inv.empty:
     current_alerts = _sentinel.scan(inv, orders)
     st.session_state.last_anomaly_scan = current_alerts
 else:
     current_alerts = []
 
-# Predictive forecast
 forecast = _oracle.forecast(days=14) if not inv.empty else None
 
-# Update route optimizer heatmap
 if not inv.empty:
     sku_visits = dict(zip(inv["sku"].tolist(), inv["stock"].astype(int).tolist()))
     _route_optimizer.update_heat(sku_visits)
@@ -900,26 +836,27 @@ if forecast:
     st.markdown(f"<div style='background:rgba(255,107,107,0.1); border-left:3px solid #ff6b6b; padding:10px 15px; border-radius:0 8px 8px 0; margin-bottom:10px;'>🔮 <b>Oracle Forecast:</b> {forecast['trend']} trend detected. Stockout risk: <span class='{'danger-glow' if forecast['stockout_risk']=='HIGH' else 'success-glow'}'>{forecast['stockout_risk']}</span>. Recommended reorder: <b>{forecast['recommended_reorder']}</b> units (confidence: {forecast['confidence']}%)</div>", unsafe_allow_html=True)
 
 # --- TAB DEFINITIONS ---
-tab_names = ["Dashboard", "Inventory", "Orders", "Auditor", "Bulk Convert", "PDF Sequencer", "Templates", "Memory", "🧠 Neural Ops", "🗺️ Holo-Deck", "⚡ Quantum Routes", "🎮 Command Center", "🌱 Eco-Logistics"]
+tab_names = ["Dashboard", "🎛️ Control Tower", "Inventory", "Orders", "Auditor", "Bulk Convert", "📦 PDF Sequencer v4.1", "Templates", "Memory", "🧠 Neural Ops", "🗺️ Holo-Deck", "⚡ Quantum Routes", "🎮 Command Center", "🌱 Eco-Logistics"]
 if role == "Admin":
     tab_names.append("Admin 🔐")
 
 tabs = st.tabs(tab_names)
 
 tab_dash = tabs[0]
-tab_inv = tabs[1]
-tab_ord = tabs[2]
-tab_aud = tabs[3]
-tab_bulk = tabs[4]
-tab_pdf = tabs[5]
-tab_temp = tabs[6]
-tab_mem = tabs[7]
-tab_neural = tabs[8]
-tab_holo = tabs[9]
-tab_quantum = tabs[10]
-tab_cmd = tabs[11]
-tab_eco = tabs[12]
-tab_admin = tabs[13] if role == "Admin" else None
+tab_tower = tabs[1]
+tab_inv = tabs[2]
+tab_ord = tabs[3]
+tab_aud = tabs[4]
+tab_bulk = tabs[5]
+tab_pdf = tabs[6]
+tab_temp = tabs[7]
+tab_mem = tabs[8]
+tab_neural = tabs[9]
+tab_holo = tabs[10]
+tab_quantum = tabs[11]
+tab_cmd = tabs[12]
+tab_eco = tabs[13]
+tab_admin = tabs[14] if role == "Admin" else None
 
 
 # --- TABS CONTENT ---
@@ -929,13 +866,11 @@ with tab_dash:
     st.subheader("Neural Operations Dashboard")
     st.write("Real-time autonomous warehouse intelligence with predictive analytics and anomaly detection.")
 
-    # Anomaly alerts display
     if current_alerts:
         with st.expander("🚨 Active Anomaly Alerts", expanded=True):
             alert_df = pd.DataFrame([{k: v for k, v in a.items() if k != "icon"} for a in current_alerts[:10]])
             st.dataframe(alert_df, use_container_width=True, hide_index=True)
 
-    # Forecast chart
     if forecast and not _oracle.get_history_df().empty:
         hist_df = _oracle.get_history_df()
         st.line_chart(hist_df.set_index("date")[["stock", "orders"]], use_container_width=True)
@@ -943,12 +878,341 @@ with tab_dash:
     st.dataframe(inv, use_container_width=True, hide_index=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
+# ============================================================================
+# v4.1 FULFILLMENT CONTROL TOWER
+# ============================================================================
+with tab_tower:
+    st.markdown('<div class="glass">', unsafe_allow_html=True)
+    st.subheader("🎛️ Fulfillment Control Tower")
+    st.markdown("<p style='color:#8892b0;'>Unified process-efficiency hub: KPIs/OEE, wave & batch picking, ABC "
+                "slotting, auto-replenishment, cycle counting, receiving (ASN), dock scheduling and returns.</p>",
+                unsafe_allow_html=True)
+
+    kpis = _kpi.compute(forecast=forecast)
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("📈 OEE", f"{kpis['oee_pct']}%")
+    k2.metric("✅ Pick Completion", f"{kpis['pick_completion_pct']}%",
+              delta=f"{kpis['open_picks']} open")
+    k3.metric("📋 Backlog Age", f"{kpis['backlog_age_min']}m",
+              delta=f"{kpis['pending_orders']} pending")
+    k4.metric("📉 Stockout Risk", kpis["stockout_risk_skus"], delta="SKUs")
+    k5.metric("🎯 Cycle Accuracy", f"{kpis['cycle_accuracy_pct']}%")
+    log_action(user, "KPI Snapshot", str(kpis["oee_pct"]))
+
+    mode = st.radio(
+        "Workflow",
+        ["🌊 Wave & Batch Picking", "🏷️ ABC Slotting", "🔄 Replenishment",
+         "🔍 Cycle Counting", "📦 Receiving (ASN)", "🚪 Dock Scheduling",
+         "↩️ Returns / RMA", "👷 Labor Productivity", "🤖 Auto-Workflow"],
+        horizontal=True, label_visibility="collapsed")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if mode == "🌊 Wave & Batch Picking":
+        st.markdown('<div class="glass">', unsafe_allow_html=True)
+        st.markdown("### 🌊 Wave Planning")
+        wcol1, wcol2 = st.columns([1, 2])
+        with wcol1:
+            strategy = st.selectbox("Pick strategy", ["batch", "single", "zone"])
+            wave_limit = st.number_input("Max orders in wave", 1, 100, 25)
+            assign_to = st.text_input("Assign to operator (optional)", value=user)
+            if st.button("🚀 Generate Wave", type="primary", use_container_width=True):
+                plan = _wave_planner.plan(strategy=strategy, limit=int(wave_limit))
+                if plan:
+                    if assign_to:
+                        _wave_planner.assign_wave(plan.wave_id, assign_to)
+                    st.success(f"✅ Wave {plan.wave_id} created — {len(plan.tasks)} pick tasks, "
+                               f"{plan.total_picks} units, {plan.unique_skus} unique SKUs, "
+                               f"~{plan.batches_saved} trips saved via consolidation.")
+                    enqueue_action("wave_created", {"wave_id": plan.wave_id, "strategy": strategy})
+                    log_action(user, "Wave Created", f"{plan.wave_id} ({strategy}): {len(plan.tasks)} tasks")
+                    st.session_state.operator_stats[user].add_xp(30, "pick")
+                    st.rerun()
+                else:
+                    st.warning("No pending orders to wave. Create orders first.")
+        with wcol2:
+            waves_df = get_waves()
+            st.markdown(f"#### Open Waves ({len(waves_df[waves_df['status']=='Open']) if not waves_df.empty else 0})")
+            if not waves_df.empty:
+                st.dataframe(waves_df[["wave_id", "status", "strategy", "assigned_to", "priority", "created_at"]],
+                             use_container_width=True, hide_index=True)
+                open_waves = waves_df[waves_df["status"] == "Open"]["wave_id"].tolist()
+                if open_waves:
+                    sel_wave = st.selectbox("Manage wave", open_waves)
+                    if st.button("Close wave", use_container_width=True):
+                        _wave_planner.close_wave(sel_wave)
+                        log_action(user, "Wave Closed", sel_wave)
+                        st.rerun()
+                    tasks_df = get_pick_tasks()
+                    wave_tasks = tasks_df[tasks_df["wave_id"] == sel_wave] if not tasks_df.empty else pd.DataFrame()
+                    st.dataframe(wave_tasks[["task_id", "sku", "location", "qty", "status", "assigned_to"]],
+                                 use_container_width=True, hide_index=True)
+            else:
+                st.info("No waves yet. Generate one to create pick tasks.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    elif mode == "🏷️ ABC Slotting":
+        st.markdown('<div class="glass">', unsafe_allow_html=True)
+        st.markdown("### 🏷️ ABC Slotting Optimizer")
+        st.caption("Classifies SKUs A (fast 20%) / B (medium) / C (slow) by pick velocity and recommends golden-zone locations.")
+        if st.button("Run slotting analysis", type="primary", use_container_width=True):
+            with st.spinner("Analyzing velocity and classifying SKUs..."):
+                slot_df = _slotting.analyze()
+                summ = _slotting.summary(slot_df)
+                st.success(f"✅ Analyzed {len(slot_df)} SKUs — A:{summ['A']} B:{summ['B']} C:{summ['C']}. "
+                           f"{summ['reslot_recommendations']} fast-movers recommended for re-slotting.")
+                log_action(user, "Slotting Analysis", str(summ))
+                st.session_state.operator_stats[user].add_xp(25, "audit")
+                st.rerun()
+        slot_view = get_slotting()
+        if not slot_view.empty:
+            abc_counts = slot_view["abc_class"].value_counts().to_dict()
+            a_c, b_c, c_c = st.columns(3)
+            a_c.metric("A — Fast", abc_counts.get("A", 0))
+            b_c.metric("B — Medium", abc_counts.get("B", 0))
+            c_c.metric("C — Slow", abc_counts.get("C", 0))
+            reslot = slot_view[(slot_view["abc_class"] == "A") & (slot_view["recommended_location"] != slot_view["current_location"])]
+            st.markdown("#### 🔄 Recommended Re-slots (fast movers)")
+            st.dataframe(reslot[["sku", "abc_class", "velocity_score", "current_location", "recommended_location", "rationale"]],
+                         use_container_width=True, hide_index=True)
+        else:
+            st.info("Run an analysis to classify your SKUs.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    elif mode == "🔄 Replenishment":
+        st.markdown('<div class="glass">', unsafe_allow_html=True)
+        st.markdown("### 🔄 Auto-Replenishment Engine")
+        st.caption("Generates replenishment suggestions for any SKU at/below its reorder point.")
+        if st.button("Generate replenishment suggestions", type="primary", use_container_width=True):
+            with st.spinner("Scanning stock vs reorder points..."):
+                sug = _replen_engine.generate(forecast=forecast)
+                st.success(f"✅ Generated {len(sug)} replenishment suggestions.")
+                enqueue_action("replenishment_generated", {"count": len(sug)})
+                log_action(user, "Replenishment Generated", str(len(sug)))
+                st.rerun()
+        repl_df = get_replenishments(status="Open")
+        if not repl_df.empty:
+            st.dataframe(repl_df[["repl_id", "sku", "current_stock", "reorder_point", "suggested_qty", "status"]],
+                         use_container_width=True, hide_index=True)
+            sel_repl = st.selectbox("Complete replenishment", repl_df["repl_id"].tolist())
+            if st.button("Mark replenished", use_container_width=True):
+                complete_replenishment(sel_repl, user)
+                log_action(user, "Replenishment Completed", sel_repl)
+                st.session_state.operator_stats[user].add_xp(15, "pick")
+                st.success("Replenishment completed.")
+                st.rerun()
+        else:
+            st.info("No open replenishments.")
+        with st.expander("Set SKU reorder policy (min / max / reorder point)"):
+            inv_full = get_inventory_full()
+            if not inv_full.empty:
+                pol_sku = st.selectbox("SKU", inv_full["sku"].tolist(), key="pol_sku")
+                row = inv_full[inv_full["sku"] == pol_sku].iloc[0]
+                rp = st.number_input("Reorder point", 0, value=int(row["reorder_point"]))
+                mn = st.number_input("Min stock", 0, value=int(row["min_stock"]))
+                mx = st.number_input("Max stock", 0, value=int(row["max_stock"]))
+                if st.button("Save policy"):
+                    upsert_inventory_policy(pol_sku, reorder_point=int(rp), min_stock=int(mn), max_stock=int(mx),
+                                            abc_class=row["abc_class"], velocity=float(row["velocity"]))
+                    st.success("Policy saved.")
+                    log_action(user, "Policy Updated", pol_sku)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    elif mode == "🔍 Cycle Counting":
+        st.markdown('<div class="glass">', unsafe_allow_html=True)
+        st.markdown("### 🔍 Cycle Count Scheduler")
+        st.caption("Schedules counts weighted by ABC class (A counted most often).")
+        force = st.checkbox("Schedule counts for ALL SKUs (ignore sampling)", value=False)
+        if st.button("Schedule cycle counts", type="primary", use_container_width=True):
+            scheduled = _cycle_scheduler.schedule(force_all=force)
+            st.success(f"✅ Scheduled {len(scheduled)} cycle counts.")
+            log_action(user, "Cycle Counts Scheduled", str(len(scheduled)))
+            st.session_state.operator_stats[user].add_xp(20, "audit")
+            st.rerun()
+        cc_df = get_cycle_counts(status="Scheduled")
+        if not cc_df.empty:
+            st.dataframe(cc_df[["count_id", "sku", "location", "expected_qty", "abc_class", "assigned_to"]],
+                         use_container_width=True, hide_index=True)
+            sel_cc = st.selectbox("Record count", cc_df["count_id"].tolist())
+            counted = st.number_input("Counted quantity", 0, value=int(cc_df[cc_df["count_id"]==sel_cc].iloc[0]["expected_qty"]))
+            if st.button("Submit count", use_container_width=True):
+                complete_cycle_count(sel_cc, int(counted), user)
+                row = cc_df[cc_df["count_id"]==sel_cc].iloc[0]
+                var = int(counted) - int(row["expected_qty"])
+                log_action(user, "Cycle Count Submitted", f"{sel_cc}: variance {var}")
+                if var == 0:
+                    st.success("✅ Count matches expected — zero variance.")
+                else:
+                    st.warning(f"Variance of {var} units recorded.")
+                st.rerun()
+        else:
+            st.info("No scheduled counts. Run the scheduler.")
+        done = get_cycle_counts(status="Completed")
+        if not done.empty:
+            st.markdown("#### Recent completed counts")
+            st.dataframe(done[["count_id", "sku", "expected_qty", "counted_qty", "variance", "assigned_to"]].head(15),
+                         use_container_width=True, hide_index=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    elif mode == "📦 Receiving (ASN)":
+        st.markdown('<div class="glass">', unsafe_allow_html=True)
+        st.markdown("### 📦 Advanced Shipping Notice (Inbound Receiving)")
+        with st.form("asn_form", clear_on_submit=True):
+            asn_id = st.text_input("ASN ID")
+            supplier = st.text_input("Supplier")
+            expected = st.text_area("Expected SKUs (one per line)")
+            door = st.text_input("Dock door", value="D1")
+            eta = st.text_input("ETA (YYYY-MM-DD HH:MM)", value=datetime.now().strftime("%Y-%m-%d %H:%M"))
+            submitted = st.form_submit_button("Create ASN")
+        if submitted and asn_id:
+            items = [s.strip() for s in expected.splitlines() if s.strip()]
+            create_asn(asn_id, supplier, items, dock_door=door, eta=eta)
+            enqueue_action("asn_created", {"asn_id": asn_id, "supplier": supplier})
+            log_action(user, "ASN Created", asn_id)
+            st.success("ASN created.")
+            st.rerun()
+        asn_df = get_asns()
+        if not asn_df.empty:
+            st.dataframe(asn_df[["asn_id", "supplier", "expected_items", "status", "dock_door", "eta"]],
+                         use_container_width=True, hide_index=True)
+            open_asns = asn_df[asn_df["status"] != "Received"]["asn_id"].tolist()
+            if open_asns:
+                sel_asn = st.selectbox("Receive ASN", open_asns)
+                if st.button("Mark received", type="primary"):
+                    receive_asn(sel_asn)
+                    log_action(user, "ASN Received", sel_asn)
+                    st.session_state.operator_stats[user].add_xp(15, "scan")
+                    st.success(f"ASN {sel_asn} marked received.")
+                    st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    elif mode == "🚪 Dock Scheduling":
+        st.markdown('<div class="glass">', unsafe_allow_html=True)
+        st.markdown("### 🚪 Dock Door Appointments")
+        with st.form("dock_form", clear_on_submit=True):
+            appt_id = st.text_input("Appointment ID")
+            door = st.text_input("Dock door", value="D1")
+            carrier = st.text_input("Carrier")
+            direction = st.selectbox("Direction", ["Inbound", "Outbound"])
+            appt_time = st.text_input("Appointment time", value=datetime.now().strftime("%Y-%m-%d %H:%M"))
+            submitted = st.form_submit_button("Schedule appointment")
+        if submitted and appt_id:
+            create_dock_appointment(appt_id, door, carrier, direction, appt_time)
+            enqueue_action("dock_scheduled", {"appt_id": appt_id, "door": door})
+            log_action(user, "Dock Scheduled", appt_id)
+            st.success("Appointment scheduled.")
+            st.rerun()
+        dock_df = get_dock_appointments()
+        if not dock_df.empty:
+            st.dataframe(dock_df[["appointment_id", "door", "carrier", "direction", "appointment_time", "status"]],
+                         use_container_width=True, hide_index=True)
+        else:
+            st.info("No dock appointments yet.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    elif mode == "↩️ Returns / RMA":
+        st.markdown('<div class="glass">', unsafe_allow_html=True)
+        st.markdown("### ↩️ Returns (RMA) Workflow")
+        with st.form("rma_form", clear_on_submit=True):
+            rma_id = st.text_input("RMA ID")
+            order_id = st.text_input("Original order ID")
+            sku = st.text_input("SKU")
+            reason = st.text_input("Return reason")
+            condition = st.selectbox("Condition", ["Uninspected", "Damaged", "Good", "Resealed"])
+            submitted = st.form_submit_button("Log return")
+        if submitted and rma_id:
+            create_rma(rma_id, order_id, sku, reason, condition=condition)
+            enqueue_action("rma_created", {"rma_id": rma_id, "sku": sku})
+            log_action(user, "RMA Created", rma_id)
+            st.success("Return logged.")
+            st.rerun()
+        rma_df = get_rmas()
+        if not rma_df.empty:
+            st.dataframe(rma_df[["rma_id", "order_id", "sku", "reason", "condition", "disposition", "status"]],
+                         use_container_width=True, hide_index=True)
+            open_rmas = rma_df[rma_df["status"] != "Processed"]["rma_id"].tolist()
+            if open_rmas:
+                sel_rma = st.selectbox("Process RMA", open_rmas)
+                disp = st.selectbox("Disposition", ["Restock", "Repair", "Refurbish", "Scrap", "Return to vendor"])
+                if st.button("Set disposition", type="primary"):
+                    update_rma_disposition(sel_rma, disp)
+                    log_action(user, "RMA Processed", f"{sel_rma} -> {disp}")
+                    st.success(f"RMA {sel_rma} marked {disp}.")
+                    st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    elif mode == "👷 Labor Productivity":
+        st.markdown('<div class="glass">', unsafe_allow_html=True)
+        st.markdown("### 👷 Labor Productivity")
+        labor_df = get_labor_summary()
+        if not labor_df.empty:
+            st.dataframe(labor_df, use_container_width=True, hide_index=True)
+            pick_total = int(labor_df[labor_df["activity"] == "pick"]["units"].sum()) if "activity" in labor_df.columns else 0
+            st.metric("🧺 Total units picked (logged)", pick_total)
+        else:
+            st.info("No labor events yet.")
+        with st.expander("Recent activity log"):
+            st.dataframe(get_labor_logs(100), use_container_width=True, hide_index=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    elif mode == "🤖 Auto-Workflow":
+        st.markdown('<div class="glass">', unsafe_allow_html=True)
+        st.markdown("### 🤖 Automated Workflow Engine")
+        st.caption("One-click automation: run slotting → schedule counts → generate waves → create replenishments.")
+
+        col_aw1, col_aw2, col_aw3 = st.columns(3)
+        with col_aw1:
+            auto_slotting = st.checkbox("Run ABC Slotting", value=True)
+            auto_counts = st.checkbox("Schedule Cycle Counts", value=True)
+        with col_aw2:
+            auto_waves = st.checkbox("Generate Pick Waves", value=True)
+            auto_replen = st.checkbox("Generate Replenishments", value=True)
+        with col_aw3:
+            wave_strategy = st.selectbox("Wave strategy", ["batch", "single", "zone"])
+            max_wave_orders = st.number_input("Max orders/wave", 1, 100, 25)
+
+        if st.button("🚀 Execute Full Workflow", type="primary", use_container_width=True):
+            results = []
+
+            if auto_slotting:
+                with st.spinner("Running ABC slotting..."):
+                    slot_df = _slotting.analyze()
+                    summ = _slotting.summary(slot_df)
+                    results.append(f"🏷️ Slotting: {summ['A']}A / {summ['B']}B / {summ['C']}C, {summ['reslot_recommendations']} re-slots")
+                    st.session_state.operator_stats[user].add_xp(25, "audit")
+
+            if auto_counts:
+                with st.spinner("Scheduling cycle counts..."):
+                    scheduled = _cycle_scheduler.schedule()
+                    results.append(f"🔍 Cycle counts: {len(scheduled)} scheduled")
+                    st.session_state.operator_stats[user].add_xp(20, "audit")
+
+            if auto_waves:
+                with st.spinner("Generating pick waves..."):
+                    plan = _wave_planner.plan(strategy=wave_strategy, limit=int(max_wave_orders))
+                    if plan:
+                        results.append(f"🌊 Wave {plan.wave_id}: {len(plan.tasks)} tasks, {plan.batches_saved} trips saved")
+                        st.session_state.operator_stats[user].add_xp(30, "pick")
+                    else:
+                        results.append("🌊 No pending orders for waves")
+
+            if auto_replen:
+                with st.spinner("Generating replenishments..."):
+                    sug = _replen_engine.generate(forecast=forecast)
+                    results.append(f"🔄 Replenishments: {len(sug)} suggestions generated")
+
+            st.success("✅ Workflow complete!")
+            for r in results:
+                st.markdown(f"• {r}")
+            log_action(user, "Auto-Workflow Executed", " | ".join(results))
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
 with tab_inv:
     st.markdown('<div class="glass">', unsafe_allow_html=True)
     st.subheader("Inventory Management")
     with st.form("inventory_form", clear_on_submit=True):
         sku = st.text_input("SKU")
-        product = st.text_input("Product", help="Alias and Template suggestions populate below.")
+        product = st.text_input("Product")
         stock = st.number_input("Stock", min_value=0, value=0, step=1)
         location = st.text_input("Location", value="UNASSIGNED")
         note = st.text_input("Note", value="")
@@ -1027,8 +1291,7 @@ with tab_aud:
 with tab_bulk:
     st.markdown('<div class="glass">', unsafe_allow_html=True)
     st.subheader("Bulk Title Converter (Translation + Templates)")
-    st.markdown("Paste original titles (non-English). App will translate, standardize, and apply matched **Templates**.")
-    output_format = st.radio("Select Output Format for Matched Items:", ["Template Only", "Translation Only", "Combined (Template + Translation)"], horizontal=True)
+    output_format = st.radio("Select Output Format:", ["Template Only", "Translation Only", "Combined"], horizontal=True)
     col_w, col_g = st.columns(2)
     with col_w:
         white_col = st.text_area("📄 Input Original Titles (one per line)", height=300)
@@ -1063,34 +1326,224 @@ with tab_bulk:
                         results.append("")
             with col_g:
                 output_text = "\n".join(results)
-                st.text_area("Output (Standardized via Templates/Translation)", value=output_text, height=300)
+                st.text_area("Output", value=output_text, height=300)
             st.success(f"✅ Processed {len(lines)} titles. Applied {matched_templates_count} templates.")
             log_action(user, "Bulk Conversion", f"Processed: {len(lines)}, Templates: {matched_templates_count}")
     st.markdown("</div>", unsafe_allow_html=True)
 
+
+# ============================================================================
+# v4.1 ENHANCED PDF SEQUENCER — WB Vertical Tracking & Multi-Criteria Matching
+# ============================================================================
 with tab_pdf:
     st.markdown('<div class="glass">', unsafe_allow_html=True)
-    st.subheader("Pro PDF Label Sequencer")
-    sequencer_mode = st.radio("🎯 Select Sequencing Mode:", ["📋 Smart Sort (Flexible)", "🔒 Strict Rearrange (Exact Order)", "📱 WB Phone+Code Matcher"], horizontal=True, help="Smart Sort: Includes unmatched pages. Strict: ONLY pages matching your sequence. WB Phone+Code: Matches by phone number + 4-digit code from Wildberries labels.")
+    st.subheader("📦 Pro PDF Label Sequencer v4.1")
+    st.markdown("<p style='color:#8892b0;'>Advanced sequencing with WB vertical tracking detection, "
+                "rotation-aware OCR, QR data extraction, and multi-criteria confidence scoring.</p>",
+                unsafe_allow_html=True)
+
+    sequencer_mode = st.radio(
+        "🎯 Sequencing Mode:",
+        ["📋 Smart Sort (Flexible)", "🔒 Strict Rearrange (Exact Order)", 
+         "📱 WB Phone+Code Matcher", "🏷️ WB Advanced Multi-Criteria (v4.1)"],
+        horizontal=True,
+        help="WB Advanced: detects vertical tracking numbers, parses QR payloads, matches by tracking#/orderID/phone+code with confidence scores."
+    )
+
     st.divider()
     col1, col2 = st.columns([1, 2])
 
     with col1:
-        if sequencer_mode == "📱 WB Phone+Code Matcher":
-            sort_list = st.text_area("Target Phone+Code List", height=300, placeholder="Paste phone numbers and 4-digit codes here...\nExample:\n5261288 1844\n5385799 3666")
-            st.caption("Format: `phone_number 4-digit_code` (one per line). OCR will scan the bottom-right QR area of each label.")
+        if sequencer_mode == "🏷️ WB Advanced Multi-Criteria (v4.1)":
+            sort_list = st.text_area(
+                "Target List (mixed formats supported)",
+                height=300,
+                placeholder="Paste any combination of:
+"
+                           "• WB tracking numbers: WBAERUGBACE0900JRM
+"
+                           "• Phone + Code: 5261288 1844
+"
+                           "• Order IDs: 123456789
+"
+                           "• Any mixed line with digits"
+            )
+            st.caption("**v4.1 Auto-Detection:** The engine automatically identifies tracking numbers, phone codes, and order IDs from each line.")
+            st.caption("**Vertical Text:** Rotation-aware OCR scans at 0°, 90°, 180°, 270° to catch sideways-printed numbers.")
+        elif sequencer_mode == "📱 WB Phone+Code Matcher":
+            sort_list = st.text_area("Target Phone+Code List", height=300, 
+                                    placeholder="5261288 1844\n5385799 3666")
+            st.caption("Format: `phone_number 4-digit_code` (one per line).")
         else:
-            sort_list = st.text_area("Target Sequence Order", height=300, placeholder="Paste Tracking IDs here...")
-        remove_duplicates = st.checkbox("Auto-Remove Duplicate IDs", value=True, help="Removes duplicate entries from your pasted sequence while preserving the order.")
+            sort_list = st.text_area("Target Sequence Order", height=300, 
+                                    placeholder="Paste Tracking IDs here...")
+
+        remove_duplicates = st.checkbox("Auto-Remove Duplicate IDs", value=True)
+        show_debug = st.checkbox("Show Debug Overlays", value=False, 
+                                 help="Generate annotated preview images showing detected regions")
+
+        if sequencer_mode == "🏷️ WB Advanced Multi-Criteria (v4.1)":
+            confidence_threshold = st.slider("Minimum match confidence", 0.0, 1.0, 0.5, 0.05,
+                                            help="Lower = more matches but possibly less accurate")
+            st.info("**🏷️ WB Advanced Mode** — Multi-criteria matching with confidence scoring:\n"
+                   "1. Tracking number exact match (confidence 1.0)\n"
+                   "2. Phone + Code pair match (confidence 0.95)\n"
+                   "3. Order ID match (confidence 0.9)\n"
+                   "4. QR payload data match (confidence 0.85)\n"
+                   "5. Fuzzy digit overlap (confidence 0.5+)")
 
     with col2:
         label_file = st.file_uploader("Upload Labels PDF (Bulk)", type="pdf")
         use_ocr = st.checkbox("Enable OCR Fallback", value=True)
-        if sequencer_mode == "📱 WB Phone+Code Matcher":
-            st.info("**📱 WB Phone+Code Mode** — Optimized for Wildberries shipping labels containing a 7-digit phone number and 4-digit delivery code.")
+
+        if sequencer_mode == "🏷️ WB Advanced Multi-Criteria (v4.1)":
+            st.info("**🔍 Detection Pipeline:**\n"
+                   "• Barcode/QR decode (all orientations)\n"
+                   "• Rotation-aware OCR (0°, 90°, 180°, 270°)\n"
+                   "• Vertical text extraction\n"
+                   "• Structured QR payload parsing\n"
+                   "• Multi-criteria confidence scoring")
 
     if st.button("⚙️ Process PDF", type="primary", use_container_width=True):
-        if sequencer_mode == "📱 WB Phone+Code Matcher":
+
+        # ================================================================
+        # v4.1 WB ADVANCED MULTI-CRITERIA MODE
+        # ================================================================
+        if sequencer_mode == "🏷️ WB Advanced Multi-Criteria (v4.1)":
+            if not sort_list or not label_file:
+                st.warning("Please provide your target list and upload a PDF.")
+            else:
+                with st.spinner("🔍 Running WB Advanced Detection Pipeline..."):
+                    try:
+                        # Parse targets
+                        targets = parse_target_list(sort_list)
+                        if remove_duplicates:
+                            seen = set()
+                            unique_targets = []
+                            for t in targets:
+                                key = t.get('tracking', '') + '|' + t.get('phone', '') + '|' + t.get('code', '')
+                                if key not in seen:
+                                    seen.add(key)
+                                    unique_targets.append(t)
+                            targets = unique_targets
+
+                        st.info(f"📋 Parsed {len(targets)} unique target entries from your list")
+
+                        # Process PDF with WBLabelProcessor
+                        pdf_bytes = label_file.getvalue()
+                        label_data = _wb_processor.process_pdf(pdf_bytes)
+
+                        st.success(f"📄 Processed {len(label_data)} pages. Detected {sum(1 for d in label_data if d.tracking_number)} tracking numbers, "
+                                   f"{sum(1 for d in label_data if d.phone_number)} phones, {sum(1 for d in label_data if d.delivery_code)} codes.")
+
+                        # Match targets against label data
+                        matches = _wb_processor.match_targets(targets, label_data)
+
+                        # Build output PDF
+                        pdf_reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+                        pdf_writer = pypdf.PdfWriter()
+
+                        results_dataset = []
+                        matched_page_indices = set()
+                        new_page_counter = 1
+
+                        # First pass: add matched pages in target order
+                        for match in matches:
+                            if match.confidence >= confidence_threshold:
+                                pdf_writer.add_page(pdf_reader.pages[match.page_idx])
+                                matched_page_indices.add(match.page_idx)
+
+                                confidence_class = "match-confidence-high" if match.confidence >= 0.9 else "match-confidence-med" if match.confidence >= 0.7 else "match-confidence-low"
+
+                                results_dataset.append({
+                                    "Status": "✅ MATCHED",
+                                    "New Page #": new_page_counter,
+                                    "Target": match.target_raw[:40],
+                                    "Original Page": match.page_idx + 1,
+                                    "Match Type": match.match_type,
+                                    "Confidence": f"{match.confidence:.0%}",
+                                    "Matched Fields": str(match.matched_fields),
+                                    "_class": confidence_class
+                                })
+                                new_page_counter += 1
+
+                        # Second pass: add unmatched pages at the end
+                        extra_count = 0
+                        for ld in label_data:
+                            if ld.page_idx not in matched_page_indices:
+                                pdf_writer.add_page(pdf_reader.pages[ld.page_idx])
+                                extra_count += 1
+                                results_dataset.append({
+                                    "Status": "ℹ️ EXTRA",
+                                    "New Page #": new_page_counter,
+                                    "Target": "—",
+                                    "Original Page": ld.page_idx + 1,
+                                    "Match Type": "Unlisted",
+                                    "Confidence": "—",
+                                    "Matched Fields": f"Tracking: {ld.tracking_number or 'N/A'}",
+                                    "_class": ""
+                                })
+                                new_page_counter += 1
+
+                        # Show results
+                        if results_dataset:
+                            st.divider()
+                            st.markdown("### 📊 Sequence Alignment Results")
+                            res_df = pd.DataFrame([{k: v for k, v in r.items() if k != "_class"} for r in results_dataset])
+
+                            def highlight_status(val):
+                                if '✅' in str(val): return 'background-color: rgba(0, 255, 136, 0.15); color: #00ff88;'
+                                if '❌' in str(val): return 'background-color: rgba(255, 107, 107, 0.15); color: #ff6b6b;'
+                                if 'ℹ️' in str(val): return 'background-color: rgba(255, 217, 61, 0.15); color: #ffd93d;'
+                                return ''
+
+                            st.dataframe(res_df.style.applymap(highlight_status, subset=['Status']), 
+                                        use_container_width=True, hide_index=True)
+
+                            # Stats
+                            matched_count = sum(1 for r in results_dataset if '✅' in r['Status'])
+                            missing_count = len(targets) - len(matches)
+                            c_stat1, c_stat2, c_stat3, c_stat4 = st.columns(4)
+                            c_stat1.metric("✅ Sequenced", matched_count)
+                            c_stat2.metric("❌ Missing", missing_count)
+                            c_stat3.metric("ℹ️ Extra", extra_count)
+                            c_stat4.metric("🎯 Avg Confidence", 
+                                          f"{sum(m.confidence for m in matches)/len(matches):.0%}" if matches else "N/A")
+
+                        # Debug overlays
+                        if show_debug:
+                            st.divider()
+                            st.markdown("### 🔍 Debug Detection Overlays")
+                            debug_cols = st.columns(3)
+                            for idx, ld in enumerate(label_data):
+                                if idx < 9:  # Limit to first 9 for performance
+                                    with debug_cols[idx % 3]:
+                                        img = convert_from_bytes(pdf_bytes, dpi=150)[ld.page_idx]
+                                        overlay = _wb_processor.generate_debug_overlay(img, ld)
+                                        st.image(overlay, caption=f"Page {ld.page_idx+1}", use_container_width=True)
+
+                        # Download
+                        if matched_count > 0 or extra_count > 0:
+                            out_io = io.BytesIO()
+                            pdf_writer.write(out_io)
+                            log_action(user, "PDF_SEQUENCED_WB_ADVANCED", 
+                                      f"Matched: {matched_count}, Missing: {missing_count}, Extra: {extra_count}")
+                            st.success(f"✅ Sequenced PDF Ready! Reordered {matched_count} labels to your list.")
+                            filename = f"WB_Advanced_Sequenced_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
+                            st.download_button(label="📥 Download Reordered PDF", data=out_io.getvalue(), 
+                                              file_name=filename, mime="application/pdf", use_container_width=True)
+                        else:
+                            st.error("❌ Could not detect any matching labels.")
+
+                    except Exception as e:
+                        st.error(f"❌ Processing Error: {str(e)}")
+                        import traceback
+                        st.code(traceback.format_exc())
+
+        # ================================================================
+        # ORIGINAL WB PHONE+CODE MODE (preserved)
+        # ================================================================
+        elif sequencer_mode == "📱 WB Phone+Code Matcher":
             target_entries = []
             for line in sort_list.strip().split('\n'):
                 line = line.strip()
@@ -1125,22 +1578,19 @@ with tab_pdf:
                     try:
                         pdf_reader = pypdf.PdfReader(io.BytesIO(label_file.getvalue()))
                         pdf_writer = pypdf.PdfWriter()
-                        images = convert_from_bytes(label_file.getvalue(), dpi=300)  # Higher DPI for better accuracy
+                        images = convert_from_bytes(label_file.getvalue(), dpi=300)
                         page_matches = []
 
                         for i, img in enumerate(images):
                             w, h = img.size
                             all_text = ""
 
-                            # 1. Barcodes
                             barcodes = decode(img)
                             for b in barcodes:
                                 all_text += " " + b.data.decode("utf-8", errors="ignore")
 
-                            # 2. Full page OCR
                             all_text += " " + pytesseract.image_to_string(img, config='--psm 6')
 
-                            # 3. Enhanced bottom-right QR crop (primary location for phone+code on WB labels)
                             right_crop = img.crop((int(w * 0.55), int(h * 0.55), w, h))
                             for angle in [0, 90, 180, 270]:
                                 rotated = right_crop.rotate(angle, expand=True)
@@ -1148,12 +1598,11 @@ with tab_pdf:
                                     ocr = pytesseract.image_to_string(rotated, config=psm)
                                     all_text += " " + ocr
 
-                            # 4. Additional mid-bottom crop for addresses/codes
                             mid_crop = img.crop((int(w * 0.4), int(h * 0.7), int(w * 0.9), h))
                             all_text += " " + pytesseract.image_to_string(mid_crop, config='--psm 6')
 
-                            phones_found = list(set(re.findall(r'\d{7}', all_text)))
-                            codes_found = list(set(re.findall(r'\d{4}', all_text)))
+                            phones_found = list(set(re.findall(r'\b\d{7}\b', all_text)))
+                            codes_found = list(set(re.findall(r'\b\d{4}\b', all_text)))
                             tracking_ids = SCANNING_ID_REGEX.findall(all_text)
                             tracking_id = tracking_ids[0] if tracking_ids else "N/A"
 
@@ -1163,7 +1612,7 @@ with tab_pdf:
                                 'tracking_id': tracking_id, 
                                 'phones': phones_found, 
                                 'codes': codes_found,
-                                'raw_text_sample': all_text[-200:]  # Debug: last 200 chars of extracted text
+                                'raw_text_sample': all_text[-200:]
                             })
 
                         matched_page_indices = []
@@ -1218,11 +1667,10 @@ with tab_pdf:
                                 return ''
                             st.dataframe(res_df.style.applymap(style_rows, subset=['Status']), use_container_width=True, hide_index=True)
 
-                            # Debug: show raw OCR samples for unmatched pages to help troubleshoot
                             with st.expander("🔍 Debug OCR Samples (Unmatched Pages)", expanded=False):
                                 unmatched_samples = [pm for pm in page_matches if pm['page_idx'] not in matched_page_indices]
                                 if unmatched_samples:
-                                    for pm in unmatched_samples[:5]:  # limit to first 5
+                                    for pm in unmatched_samples[:5]:
                                         st.markdown(f"**Page {pm['page_idx']+1}** — Phones: `{pm['phones']}` | Codes: `{pm['codes']}`")
                                         st.code(pm['raw_text_sample'], language='text')
                                 else:
@@ -1245,6 +1693,10 @@ with tab_pdf:
                             st.error("❌ Could not detect any matching label numbers in the uploaded document.")
                     except Exception as e:
                         st.error(f"❌ Processing Error: {str(e)}")
+
+        # ================================================================
+        # STANDARD MODES (Smart Sort / Strict Rearrange)
+        # ================================================================
         else:
             target_ids_raw = [tid.strip() for tid in sort_list.split('\n') if tid.strip()]
             target_ids = []
@@ -1346,6 +1798,7 @@ with tab_pdf:
                         st.error(f"❌ Processing Error: {str(e)}")
     st.markdown("</div>", unsafe_allow_html=True)
 
+
 with tab_temp:
     st.markdown('<div class="glass">', unsafe_allow_html=True)
     st.subheader("Templates Database")
@@ -1393,10 +1846,6 @@ with tab_mem:
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# NEW CREATIVE TABS
-# ═════════════════════════════════════════════════════════════════════════════
-
 with tab_neural:
     st.markdown('<div class="glass">', unsafe_allow_html=True)
     st.subheader("🧠 Neural Operations Center")
@@ -1414,9 +1863,7 @@ with tab_neural:
             img = Image.open(vision_file)
             with st.spinner("Running neural vision pipeline..."):
                 processed_img, detections = _neural_vision.process_frame(img)
-
                 st.image(processed_img, caption="Neural Vision Overlay", use_container_width=True)
-
                 if detections:
                     det_df = pd.DataFrame([{"Label": d["label"], "Confidence": f"{d['confidence']:.1f}%", "Area": d["area"], "Vertices": d["vertices"]} for d in detections if d["confidence"] >= vision_confidence])
                     if not det_df.empty:
@@ -1465,14 +1912,109 @@ with tab_neural:
 
     st.markdown("</div>", unsafe_allow_html=True)
 
+
 with tab_holo:
     st.markdown('<div class="glass">', unsafe_allow_html=True)
     st.subheader("🗺️ Warehouse Holo-Deck")
-    st.markdown("<p style='color:#8892b0;'>Interactive 3D digital twin of your warehouse with real-time zone monitoring and particle effects.</p>", unsafe_allow_html=True)
+    st.markdown("<p style='color:#8892b0;'>Interactive 3D digital twin of your warehouse with real-time zone monitoring.</p>", unsafe_allow_html=True)
 
     holo_cols = st.columns([3, 1])
     with holo_cols[0]:
-        st.components.v1.html(render_holodeck_3d(), height=620)
+        holo_html = """
+        <div id="warehouse-3d" style="width:100%; height:600px; background:#050a19; border-radius:16px; overflow:hidden; position:relative; border:1px solid rgba(100,255,218,0.2);">
+          <canvas id="glcanvas" style="width:100%; height:100%;"></canvas>
+          <div style="position:absolute; top:15px; left:15px; color:#64ffda; font-family:monospace; font-size:11px; background:rgba(5,10,25,0.85); padding:12px; border-radius:8px; border:1px solid rgba(100,255,218,0.15);">
+            <div style="font-weight:bold; font-size:13px; margin-bottom:6px;">🏭 WAREHOUSE DIGITAL TWIN</div>
+            <div id="twin-stats">Zones: 24 | Active: 18 | Temp: 22°C | Humidity: 45%</div>
+            <div style="margin-top:4px; color:#8892b0;">Live Neural Feed: <span style="color:#64ffda;">ONLINE</span></div>
+          </div>
+        </div>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+        <script>
+          const scene = new THREE.Scene();
+          scene.background = new THREE.Color(0x050a19);
+          scene.fog = new THREE.FogExp2(0x050a19, 0.015);
+          const container = document.getElementById('warehouse-3d');
+          const camera = new THREE.PerspectiveCamera(60, container.clientWidth/container.clientHeight, 0.1, 1000);
+          const renderer = new THREE.WebGLRenderer({canvas: document.getElementById('glcanvas'), antialias: true, alpha: true});
+          renderer.setSize(container.clientWidth, container.clientHeight);
+          renderer.setPixelRatio(window.devicePixelRatio);
+          const ambientLight = new THREE.AmbientLight(0x404040, 1.5);
+          scene.add(ambientLight);
+          const dirLight = new THREE.DirectionalLight(0x64ffda, 0.8);
+          dirLight.position.set(20, 30, 20);
+          scene.add(dirLight);
+          const floorGeo = new THREE.PlaneGeometry(80, 60);
+          const floorMat = new THREE.MeshPhongMaterial({color: 0x0a192f, transparent: true, opacity: 0.8, side: THREE.DoubleSide});
+          const floor = new THREE.Mesh(floorGeo, floorMat);
+          floor.rotation.x = -Math.PI / 2;
+          scene.add(floor);
+          const gridHelper = new THREE.GridHelper(80, 40, 0x64ffda, 0x0a192f);
+          gridHelper.position.y = 0.01;
+          scene.add(gridHelper);
+          const rackGeo = new THREE.BoxGeometry(3, 6, 1.5);
+          const rackMat = new THREE.MeshPhongMaterial({color: 0x112240, transparent: true, opacity: 0.85});
+          const edgesGeo = new THREE.EdgesGeometry(rackGeo);
+          const edgesMat = new THREE.LineBasicMaterial({color: 0x64ffda, transparent: true, opacity: 0.6});
+          for(let i=0; i<24; i++) {
+            const rack = new THREE.Mesh(rackGeo, rackMat);
+            const x = (i%6)*10 - 25;
+            const z = Math.floor(i/6)*10 - 15;
+            rack.position.set(x, 3, z);
+            scene.add(rack);
+            const edges = new THREE.LineSegments(edgesGeo, edgesMat);
+            edges.position.copy(rack.position);
+            scene.add(edges);
+          }
+          const pkgGeo = new THREE.BoxGeometry(1, 1, 1);
+          const packages = [];
+          for(let i=0; i<20; i++) {
+            const color = new THREE.Color().setHSL(0.45 + Math.random()*0.15, 0.9, 0.6);
+            const pkg = new THREE.Mesh(pkgGeo, new THREE.MeshPhongMaterial({color: color, emissive: color, emissiveIntensity: 0.3}));
+            pkg.position.set(Math.random()*50-25, 0.5, Math.random()*30-15);
+            scene.add(pkg);
+            packages.push({mesh: pkg, speed: 0.01 + Math.random()*0.02, offset: Math.random()*Math.PI*2, amp: 0.3 + Math.random()*0.5});
+          }
+          const particleGeo = new THREE.BufferGeometry();
+          const particleCount = 200;
+          const posArray = new Float32Array(particleCount*3);
+          for(let i=0; i<particleCount*3; i++) {
+            posArray[i] = (Math.random()-0.5)*80;
+          }
+          particleGeo.setAttribute('position', new THREE.BufferAttribute(posArray, 3));
+          const particleMat = new THREE.PointsMaterial({size: 0.15, color: 0x64ffda, transparent: true, opacity: 0.6});
+          const particles = new THREE.Points(particleGeo, particleMat);
+          scene.add(particles);
+          camera.position.set(35, 25, 35);
+          camera.lookAt(0, 0, 0);
+          let angle = 0;
+          function animate() {
+            requestAnimationFrame(animate);
+            const time = Date.now() * 0.001;
+            angle += 0.002;
+            camera.position.x = 40 * Math.cos(angle);
+            camera.position.z = 40 * Math.sin(angle);
+            camera.lookAt(0, 2, 0);
+            packages.forEach(p => {
+              p.mesh.position.y = 0.5 + Math.sin(time * 2 + p.offset) * p.amp * 0.3;
+              p.mesh.rotation.y += p.speed;
+              p.mesh.rotation.x = Math.sin(time + p.offset) * 0.1;
+            });
+            particles.rotation.y = time * 0.05;
+            particles.rotation.x = time * 0.02;
+            renderer.render(scene, camera);
+          }
+          animate();
+          window.addEventListener('resize', () => {
+            const w = container.clientWidth;
+            const h = container.clientHeight;
+            renderer.setSize(w, h);
+            camera.aspect = w / h;
+            camera.updateProjectionMatrix();
+          });
+        </script>
+        """
+        st.components.v1.html(holo_html, height=620)
 
     with holo_cols[1]:
         st.markdown("### Zone Telemetry")
@@ -1489,6 +2031,7 @@ with tab_holo:
         st.markdown(f"<div style='color:#8892b0; font-size:0.8rem; margin-top:10px;'>Last sync: {datetime.now().strftime('%H:%M:%S')}</div>", unsafe_allow_html=True)
 
     st.markdown("</div>", unsafe_allow_html=True)
+
 
 with tab_quantum:
     st.markdown('<div class="glass">', unsafe_allow_html=True)
@@ -1512,24 +2055,19 @@ with tab_quantum:
                         total_distance += _route_optimizer._dist(route[i], route[i+1])
 
                     st.success(f"✅ Route optimized! {len(route)} stops, estimated travel: {total_distance:.1f} grid units")
-                    st.markdown(f"<div class='neon-text' style='font-size:0.9rem;'>🗺️ Route: {' → '.join([r['zone'] for r in route])}</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div class='neon-text' style='font-size:0.9rem;'>🗺️ Route: {' -> '.join([r['zone'] for r in route])}</div>", unsafe_allow_html=True)
 
-                    # Display route table
                     route_df = pd.DataFrame([{"Stop": i+1, "SKU": r["sku"], "Zone": r["zone"], "X": r["x"], "Y": r["y"]} for i, r in enumerate(route)])
                     st.dataframe(route_df, use_container_width=True, hide_index=True)
 
-                    # Generate SVG visualization
                     svg_viz = _route_optimizer.generate_svg(route)
                     with q_col2:
                         st.markdown("### 🗺️ Warehouse Heatmap & Route")
                         st.markdown(svg_viz, unsafe_allow_html=True)
-
-                        # Route metrics
                         m1, m2, m3 = st.columns(3)
                         m1.metric("Total Stops", len(route))
                         m2.metric("Grid Distance", f"{total_distance:.1f}")
                         m3.metric("Efficiency", f"{max(0, 100 - total_distance/len(route)*5):.0f}%")
-
                         log_action(user, "Quantum Route Optimized", f"Stops: {len(route)}, Distance: {total_distance:.1f}")
                         st.session_state.operator_stats[user].add_xp(20, "pick")
             else:
@@ -1539,7 +2077,6 @@ with tab_quantum:
         else:
             with q_col2:
                 st.markdown("### 🗺️ Warehouse Heatmap & Route")
-                # Show empty heatmap
                 empty_svg = _route_optimizer.generate_svg([])
                 st.markdown(empty_svg, unsafe_allow_html=True)
                 st.info("Enter SKUs and click 'Calculate Quantum Route' to visualize optimal pick path.")
@@ -1556,7 +2093,7 @@ with tab_cmd:
 
     with cmd_cols[0]:
         st.markdown("### 💬 Neural Command Interface")
-        st.caption("Try: 'find SKU-123', 'move 50 SKU-456 to Zone-A', 'show low stock', 'forecast inventory', 'optimize route for SKU-001 SKU-002'")
+        st.caption("Try: 'find SKU-123', 'show low stock', 'forecast inventory', 'optimize route for SKU-001 SKU-002'")
 
         for msg in st.session_state.neural_chat_history[-10:]:
             with st.chat_message(msg["role"]):
@@ -1569,7 +2106,7 @@ with tab_cmd:
 
             response = ""
             if parsed["intent"] == "GREETING":
-                response = "👋 Welcome to Neural Command Center. I can help you find SKUs, move stock, check orders, forecast inventory, and optimize routes. What would you like to do?"
+                response = "👋 Welcome to Neural Command Center. I can help you find SKUs, move stock, check orders, forecast inventory, and optimize routes."
             elif parsed["intent"] == "FIND_SKU":
                 sku = parsed["params"][0]
                 inv_df = get_inventory()
@@ -1585,7 +2122,7 @@ with tab_cmd:
                 if not low.empty:
                     response = f"📉 Low stock alert! {len(low)} items below threshold:\n\n" + "\n".join([f"• {r['sku']}: {r['stock']} units ({r['location']})" for _, r in low.iterrows()])
                 else:
-                    response = "✅ All stock levels are healthy. No low stock items detected."
+                    response = "✅ All stock levels are healthy."
             elif parsed["intent"] == "FORECAST":
                 if forecast:
                     response = f"🔮 Oracle Forecast: **{forecast['trend']}** trend. Stockout risk: **{forecast['stockout_risk']}**. Recommended reorder: **{forecast['recommended_reorder']}** units."
@@ -1641,10 +2178,11 @@ with tab_cmd:
 
     st.markdown("</div>", unsafe_allow_html=True)
 
+
 with tab_eco:
     st.markdown('<div class="glass">', unsafe_allow_html=True)
     st.subheader("🌱 Eco-Logistics Tracker")
-    st.markdown("<p style='color:#8892b0;'>Carbon footprint analysis and sustainability recommendations for green warehouse operations.</p>", unsafe_allow_html=True)
+    st.markdown("<p style='color:#8892b0;'>Carbon footprint analysis and sustainability recommendations.</p>", unsafe_allow_html=True)
 
     eco_cols = st.columns([1, 2])
 
@@ -1676,7 +2214,6 @@ with tab_eco:
 
     with eco_cols[1]:
         st.markdown("### 📈 Sustainability Trends")
-        # Simulate historical eco data
         eco_history = []
         for i in range(30):
             date = datetime.now() - timedelta(days=30-i)
@@ -1700,13 +2237,13 @@ with tab_eco:
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-# --- ADMIN PANEL (Role Restricted) ---
+# --- ADMIN PANEL ---
 if role == "Admin" and tab_admin:
     with tab_admin:
         st.markdown('<div class="glass">', unsafe_allow_html=True)
         st.subheader("🔐 Admin Control Panel")
 
-        adm_opt = st.radio("Admin Tool", ["👤 User Management & Logs", "📱 SIM Database Manager", "🛡️ Ozone Guardian Ops Center", "🧠 Neural System Diagnostics"], horizontal=True)
+        adm_opt = st.radio("Admin Tool", ["👤 User Management & Logs", "📱 SIM Database Manager", "🧠 Neural System Diagnostics"], horizontal=True)
         st.divider()
 
         if adm_opt == "👤 User Management & Logs":
@@ -1725,7 +2262,6 @@ if role == "Admin" and tab_admin:
                 logs_df = pd.read_sql_query("SELECT created_at, user, action_type, ref_id, payload FROM action_logs ORDER BY created_at DESC LIMIT 100", conn)
             st.dataframe(logs_df, use_container_width=True, hide_index=True)
 
-            # Neural system health
             st.subheader("🧠 Neural System Health")
             h_col1, h_col2, h_col3, h_col4 = st.columns(4)
             h_col1.metric("Vision Pipeline", "ONLINE", "✅")
@@ -1741,7 +2277,7 @@ if role == "Admin" and tab_admin:
             sim_tools_col, sim_conv_col = st.columns([1, 2])
             with sim_tools_col:
                 st.markdown("### 🛠️ SIM Database Tools")
-                search_query = st.text_input("🔍 Search Model or TAC (8 digits)", help="Enter Model Name or TAC Prefix.")
+                search_query = st.text_input("🔍 Search Model or TAC (8 digits)")
                 display_sim_df = st.session_state.df_sim_db
                 if search_query:
                     display_sim_df = display_sim_df[display_sim_df['Model_Series'].str.contains(search_query, case=False, na=False) | display_sim_df['TAC_Prefix'].str.contains(search_query, na=False)]
@@ -1791,23 +2327,6 @@ if role == "Admin" and tab_admin:
                         st.write("#### Integrated Results")
                         st.dataframe(pd.DataFrame(sim_results), use_container_width=True, hide_index=True)
                         log_action(user, "SIM IMEI Converted", f"Processed: {len(sim_results)}")
-
-        elif adm_opt == "🛡️ Ozone Guardian Ops Center":
-            inv_df = get_inventory()
-            orders_df = get_orders()
-            q = queue_status()
-            ctx = {
-                "inventory": {"total_skus": len(inv_df), "total_stock": int(inv_df["stock"].sum()) if not inv_df.empty else 0},
-                "orders": orders_df.to_dict("records") if not orders_df.empty else [],
-                "pending_orders": int((orders_df["status"] == "Pending").sum()) if not orders_df.empty else 0,
-                "stale_pending_minutes": 0,
-                "sync_queue": q,
-                "low_stock_skus": inv_df[inv_df["stock"] < 5]["sku"].tolist() if not inv_df.empty else [],
-                "failed_logins_last_5m": 0,
-            }
-            _guardian.analyze(ctx)
-            render_guardian_dashboard(health=_guardian.health, alerts=_guardian.alerts, suggestions=_guardian.suggestions, recovery=_guardian.recovery, tuner=_guardian.tuner, ozone=_guardian.ozone)
-            log_action(user, "Guardian Dashboard Opened", "Ops Center")
 
         elif adm_opt == "🧠 Neural System Diagnostics":
             st.subheader("Neural System Diagnostics")
